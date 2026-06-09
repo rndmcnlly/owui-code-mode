@@ -2,7 +2,7 @@
 title: Code Mode
 author: Adam Smith
 author_url: https://github.com/rndmcnlly
-version: 1.0.0
+version: 1.1.0
 license: MIT
 description: Replaces a model's individual tool calls with a single run_python(code) tool. The model discovers its enabled toolkit functions as a typed-Python API in the system prompt, then writes a program that calls them. The program runs in an in-process pydantic_monty interpreter; each wrapped-function call is dispatched to the real Open WebUI callable (event-emitting and interactive tools included). REPL state can persist per chat so globals and helper functions the model defines survive across run_python calls within a conversation.
 required_open_webui_version: 0.9.6
@@ -75,16 +75,60 @@ def _save_repl(chat_id: str, repl, persist: bool, cache_size: int) -> None:
         _REPLS.popitem(last=False)
 
 
-def _py_type(json_type: str) -> str:
-    """Map a JSON-schema scalar type onto a Python annotation string."""
-    return {
-        "string": "str",
-        "integer": "int",
-        "number": "float",
-        "boolean": "bool",
-        "array": "list",
-        "object": "dict",
-    }.get(json_type, "object")
+_SCALARS = {
+    "string": "str",
+    "integer": "int",
+    "number": "float",
+    "boolean": "bool",
+    "null": "None",
+}
+
+
+def _render_type(schema: dict) -> str:
+    """Render a JSON-schema fragment as a Python type-annotation string.
+
+    Faithful to the constructs Open WebUI's spec generator emits (verified
+    against the jig fixture): enum -> Literal, anyOf -> Union/Optional,
+    array+items -> list[...], array+prefixItems -> tuple[...],
+    object+additionalProperties -> dict[str, ...], nested object -> dict.
+    Recurses on items/prefixItems/anyOf. Falls back to Any when nothing is
+    pinned down.
+    """
+    if not isinstance(schema, dict):
+        return "Any"
+
+    # enum: literal set of allowed values (covers Literal[...] and Enum subclasses)
+    enum = schema.get("enum")
+    if enum:
+        return f"Literal[{', '.join(repr(v) for v in enum)}]"
+
+    # anyOf: Union; a lone non-null arm reads as that arm, null arm -> Optional
+    any_of = schema.get("anyOf")
+    if any_of:
+        arms = [a for a in any_of if a.get("type") != "null"]
+        has_null = any(a.get("type") == "null" for a in any_of)
+        rendered = [_render_type(a) for a in arms] or ["Any"]
+        inner = rendered[0] if len(rendered) == 1 else f"Union[{', '.join(rendered)}]"
+        return f"Optional[{inner}]" if has_null else inner
+
+    jtype = schema.get("type")
+
+    if jtype == "array":
+        if "prefixItems" in schema:  # fixed-length heterogeneous tuple
+            elems = [_render_type(e) for e in schema["prefixItems"]]
+            return f"tuple[{', '.join(elems)}]"
+        items = schema.get("items")
+        if isinstance(items, dict):
+            return f"list[{_render_type(items)}]"
+        return "list"
+
+    if jtype == "object" or "properties" in schema:
+        add = schema.get("additionalProperties")
+        if isinstance(add, dict):
+            return f"dict[str, {_render_type(add)}]"
+        return "dict"
+
+    return _SCALARS.get(jtype, "Any")
 
 
 def _render_signature(name: str, spec: dict) -> str:
@@ -96,11 +140,16 @@ def _render_signature(name: str, spec: dict) -> str:
 
     args = []
     for pname, pinfo in props.items():
-        ann = _py_type(pinfo.get("type", "object"))
-        if pname in required:
+        ann = _render_type(pinfo)
+        if "default" in pinfo:
+            # Faithful default straight from the schema (e.g. 1.0, "hello", True).
+            args.append(f"{pname}: {ann} = {pinfo['default']!r}")
+        elif pname in required:
             args.append(f"{pname}: {ann}")
         else:
-            args.append(f"{pname}: {ann} = None")
+            # Optional with no explicit default: present as Optional[...] = None.
+            opt = ann if ann.startswith("Optional[") else f"Optional[{ann}]"
+            args.append(f"{pname}: {opt} = None")
     sig = f"def {name}({', '.join(args)}) -> Any: ..."
 
     doc_lines = []
@@ -146,7 +195,7 @@ def _build_system_prompt(registry: dict, persist: bool) -> str:
         "real tools. Use `print(...)` for anything you want surfaced back.\n\n"
         "Available wrapped API:\n\n"
         "```python\n"
-        "from typing import Any\n\n"
+        "from typing import Any, Optional, Union, Literal\n\n"
         f"{api}\n"
         "```\n\n"
         "Prefer doing as much aggregation/filtering inside the program as "
