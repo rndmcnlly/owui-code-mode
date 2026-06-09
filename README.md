@@ -58,7 +58,7 @@ Install the function and mark it **global**. The toggle then appears for every
 chat, and any user can flip it on for a specific conversation when they want
 code mode. Nothing changes for chats where the toggle is off.
 
-- Admin → Functions → install `code_mode_filter.py`, make sure it is **active**.
+- Admin → Functions → install `code_mode.py`, make sure it is **active**.
 - Toggle the function **global** (in the function's menu, or
   `POST /api/v1/functions/id/<id>/toggle/global`).
 - Users see a "Code Mode" toggle in the message-input integrations menu and opt
@@ -176,7 +176,7 @@ already have.
 ## Installation
 
 1. In Open WebUI: Admin Panel → Functions → **+** → paste the contents of
-   [`code_mode_filter.py`](./code_mode_filter.py) (or import the file).
+   [`code_mode.py`](./code_mode.py) (or import the file).
 2. **Activate** the function.
 3. Choose a deployment mode (global, or per-model default) as described above.
 4. Confirm each target model meets the three prerequisites (a toolkit enabled,
