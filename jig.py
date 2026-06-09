@@ -1,7 +1,7 @@
 """
 title: Jig
 author: adam
-version: 0.1.0
+version: 0.2.0
 description: A test toolkit for the Code Mode filter. Serves two purposes.
   (1) Smoke test: install this alongside the Code Mode filter on a fresh
   Open WebUI, enable both on a model, and you have a pile of harmless tools
@@ -13,6 +13,8 @@ description: A test toolkit for the Code Mode filter. Serves two purposes.
   which is what the filter renders back into a typed-Python API. Every tool
   just echoes its arguments back as a string; nothing has side effects.
 """
+
+import asyncio
 
 from typing import List, Tuple, Dict, Optional, Union, Literal
 from enum import Enum
@@ -146,3 +148,89 @@ class Tools:
     def mixed(self, query: str, limit: int = 5, __event_emitter__=None) -> str:
         """Real args plus an injected dunder; dunder should be stripped."""
         return f"{query} {limit}"
+
+    # =====================================================================
+    # Async tools, and tools that actually USE the injected dunders. These
+    # exercise the dispatch path the filter relies on: each wrapped call is
+    # awaited, and Open WebUI binds the dunders the function declares before
+    # the filter dispatches it. If these work through run_python, the
+    # await + dunder-binding machinery is sound.
+    # =====================================================================
+
+    # --- plain async, no dunders ------------------------------------------
+    async def async_echo(self, message: str, delay: float = 0.0) -> str:
+        """An async tool with no dunders. Optionally sleeps, then echoes.
+
+        Args:
+            message: Text to echo back.
+            delay: Seconds to await before returning (exercises real await).
+        """
+        if delay > 0:
+            await asyncio.sleep(min(delay, 2.0))
+        return f"async_echo: {message}"
+
+    # --- async + status events via __event_emitter__ ----------------------
+    async def async_progress(self, label: str, steps: int = 3, __event_emitter__=None) -> str:
+        """Emit a few status events, then finish. Uses __event_emitter__.
+
+        Args:
+            label: Description shown in each status event.
+            steps: How many progress events to emit.
+        """
+        n = max(1, min(steps, 10))
+        for i in range(n):
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {"description": f"{label} ({i + 1}/{n})", "done": False},
+                    }
+                )
+            await asyncio.sleep(0.05)
+        if __event_emitter__:
+            await __event_emitter__(
+                {"type": "status", "data": {"description": f"{label} done", "done": True}}
+            )
+        return f"async_progress: emitted {n} events for {label!r}"
+
+    # --- async + interactive prompt via __event_call__ --------------------
+    async def ask_user(self, title: str, question: str, placeholder: str = "", __event_call__=None) -> str:
+        """Prompt the user interactively and return their reply. Uses __event_call__.
+
+        Mirrors the aleatory `consult` pattern: opens an input dialog in the
+        client and blocks on the user's response.
+
+        Args:
+            title: Short title for the input dialog (1 to 3 words).
+            question: The question to put to the user.
+            placeholder: An example answer to hint the expected shape.
+        """
+        if __event_call__ is None:
+            return "ask_user: no __event_call__ available"
+        reply = await __event_call__(
+            {
+                "type": "input",
+                "data": {"title": title, "message": question, "placeholder": placeholder},
+            }
+        )
+        return f"ask_user reply: {reply}"
+
+    # --- async + request context dunders ----------------------------------
+    async def whoami(self, __user__=None, __chat_id__=None, __model__=None) -> str:
+        """Report identity/context from injected dunders without leaking secrets.
+
+        Reads __user__, __chat_id__, and __model__ and returns only coarse,
+        non-sensitive fields so it is safe to call in a demo.
+        """
+        user_name = None
+        if isinstance(__user__, dict):
+            user_name = __user__.get("name") or __user__.get("email")
+        else:
+            user_name = getattr(__user__, "name", None)
+        model_id = None
+        if isinstance(__model__, dict):
+            model_id = __model__.get("id")
+        else:
+            model_id = getattr(__model__, "id", None)
+        have_chat = bool(__chat_id__)
+        return f"whoami: user={user_name!r} model={model_id!r} chat_present={have_chat}"
