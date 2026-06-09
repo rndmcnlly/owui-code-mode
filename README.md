@@ -175,20 +175,39 @@ already have.
 
 ## Trying it out
 
-The repo includes [`jig.py`](./jig.py), a harmless **test toolkit** you can
-install to exercise the filter on a clean Open WebUI:
+The repo includes [`jig.py`](./jig.py), a harmless **test toolkit** for
+exercising the filter on a clean Open WebUI. Every tool just echoes its
+arguments back (or reports context), so nothing has side effects.
 
 1. Admin Panel → Tools (or Workspace → Tools) → install `jig.py`.
 2. Enable the `jig` toolkit on a model that meets the prerequisites above, and
    turn on Code Mode for that chat.
-3. Ask the model to call some jig tools (for example: "use the tools to roll a
-   few values and summarize them"). Each tool just echoes its arguments back, so
-   you can confirm the `run_python` round-trip works without any side effects.
+3. Ask the model to call some jig tools and report exactly what came back.
 
-`jig` also doubles as a signature fixture: every tool isolates a different
-Python signature construct (enums, arrays, tuples, unions, nested models,
-defaults, `Optional`, `Field` constraints). It is a convenient way to see how a
-toolkit's functions are presented to the model as a typed-Python API.
+`jig`'s tools fall into three groups, each probing a different part of the
+filter:
+
+- **Signature-fixture tools** (`scalars`, `arrays`, `literal_enum`,
+  `class_enum`, `union_param`, `tuple_param`, `mapping`, `model_param`,
+  `field_described`, ...) each isolate one Python signature construct (enums,
+  arrays, tuples, unions, nested models, defaults, `Optional`, `Field`
+  constraints). They let you see how a toolkit's functions are presented to the
+  model as a typed-Python API, and confirm the basic `run_python` round-trip.
+- **Async tools** (`async_echo`) confirm that `async def` tools and real
+  `await`s dispatch correctly through the interpreter.
+- **Dunder-using tools** confirm that Open WebUI's request context binds into
+  wrapped calls: `async_progress` emits status events via `__event_emitter__`,
+  `ask_user` opens an interactive input dialog via `__event_call__` and returns
+  your reply, and `whoami` reads `__user__`, `__chat_id__`, and `__model__`.
+
+A good single-program smoke test touches all three paths at once. For example:
+
+> Using the tools, emit a couple of progress updates, then ask me to name a
+> color, then tell me who I am. Report exactly what each tool returned.
+
+If that one `run_python` call shows real progress events, prompts you, and
+reports your identity, the await, event-emitter, interactive-call, and
+context-binding paths are all working.
 
 ## Installation
 
