@@ -173,6 +173,23 @@ already have.
   required Open WebUI version below, but a future core refactor of tool
   resolution could require an update here.
 
+## Trying it out
+
+The repo includes [`jig.py`](./jig.py), a harmless **test toolkit** you can
+install to exercise the filter on a clean Open WebUI:
+
+1. Admin Panel → Tools (or Workspace → Tools) → install `jig.py`.
+2. Enable the `jig` toolkit on a model that meets the prerequisites above, and
+   turn on Code Mode for that chat.
+3. Ask the model to call some jig tools (for example: "use the tools to roll a
+   few values and summarize them"). Each tool just echoes its arguments back, so
+   you can confirm the `run_python` round-trip works without any side effects.
+
+`jig` also doubles as a signature fixture: every tool isolates a different
+Python signature construct (enums, arrays, tuples, unions, nested models,
+defaults, `Optional`, `Field` constraints). It is a convenient way to see how a
+toolkit's functions are presented to the model as a typed-Python API.
+
 ## Installation
 
 1. In Open WebUI: Admin Panel → Functions → **+** → paste the contents of
