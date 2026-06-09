@@ -2,7 +2,7 @@
 title: Code Mode
 author: Adam Smith
 author_url: https://github.com/rndmcnlly
-version: 1.1.0
+version: 1.2.0
 license: MIT
 description: Replaces a model's individual tool calls with a single run_python(code) tool. The model discovers its enabled toolkit functions as a typed-Python API in the system prompt, then writes a program that calls them. The program runs in an in-process pydantic_monty interpreter; each wrapped-function call is dispatched to the real Open WebUI callable (event-emitting and interactive tools included). REPL state can persist per chat so globals and helper functions the model defines survive across run_python calls within a conversation.
 required_open_webui_version: 0.9.6
@@ -45,16 +45,30 @@ MARK = "=CODEMODE="
 _REPLS: "OrderedDict[str, bytes]" = OrderedDict()  # chat_id -> dump() blob (LRU)
 
 
-def _get_repl(chat_id: str, persist: bool):
+def _get_repl(chat_id: str, persist: bool, type_check_stubs: str):
     """Return a MontyRepl for chat_id: rehydrated from the stored blob if one
     exists and persistence is on, else fresh. A falsy chat_id or persist=False
-    yields a fresh REPL (stateless)."""
+    yields a fresh REPL (stateless).
+
+    type_check is enabled so Monty's bundled checker rejects code that violates
+    its restricted Python subset (undefined names, bad types, unavailable
+    stdlib) BEFORE execution, returning a clean MontyTypingError the model can
+    fix. The wrapped tool names are resolved dynamically at runtime (via
+    FunctionSnapshot), so the checker would otherwise flag every tool call as
+    undefined; type_check_stubs supplies their typed signatures (the same ones
+    rendered into the system prompt) so legitimate calls pass. A dump()/load()
+    round-trip preserves both the type_check flag and these stubs, so they only
+    need to be supplied here on the fresh-REPL branch."""
     if persist and chat_id:
         blob = _REPLS.get(chat_id)
         if blob is not None:
             _REPLS.move_to_end(chat_id)  # mark most-recently-used
             return pydantic_monty.MontyRepl.load(blob)
-    return pydantic_monty.MontyRepl(script_name="code_mode.py", type_check=False)
+    return pydantic_monty.MontyRepl(
+        script_name="code_mode.py",
+        type_check=True,
+        type_check_stubs=type_check_stubs,
+    )
 
 
 def _save_repl(chat_id: str, repl, persist: bool, cache_size: int) -> None:
@@ -167,12 +181,23 @@ def _render_signature(name: str, spec: dict) -> str:
     return sig
 
 
-def _build_system_prompt(registry: dict, persist: bool) -> str:
-    """Generate the typed-Python API documentation for the wrapped tools."""
+def _build_stubs(registry: dict) -> str:
+    """Render the wrapped tools as a typed-Python stub block.
+
+    Reused for two purposes: the human/model-facing API docs in the system
+    prompt, and the `type_check_stubs` handed to MontyRepl so its bundled type
+    checker recognizes the tool names (resolved dynamically at runtime) instead
+    of flagging every call as undefined."""
     sigs = []
     for name, entry in registry.items():
         sigs.append(_render_signature(name, entry.get("spec", {})))
     api = "\n\n".join(sigs)
+    return f"from typing import Any, Optional, Union, Literal\n\n{api}"
+
+
+def _build_system_prompt(registry: dict, persist: bool) -> str:
+    """Generate the typed-Python API documentation for the wrapped tools."""
+    stubs = _build_stubs(registry)
 
     persistence_note = (
         "PERSISTENT STATE: run_python is a REPL, not a fresh sandbox each call. "
@@ -188,15 +213,23 @@ def _build_system_prompt(registry: dict, persist: bool) -> str:
     return (
         "You are in CODE MODE. You do not call the wrapped functions directly. "
         "Instead, you have ONE tool: `run_python(code: str)`. Write a short "
-        "Python 3 program (string) and pass it as `code`. Inside that program "
+        "program (string) and pass it as `code`. Inside that program "
         "the following functions are pre-defined and may be called freely "
         "(including in loops, comprehensions, and conditionals). They are "
         "ordinary synchronous-looking calls; the runtime dispatches them to the "
-        "real tools. Use `print(...)` for anything you want surfaced back.\n\n"
+        "real tools. The value of the program's LAST expression is captured "
+        "and returned automatically, so you usually do not need print(): just "
+        "end the program with a bare variable or expression (e.g. `result` or "
+        "`flip('heads')`) to surface it. Use `print(...)` when you want to "
+        "surface several intermediate values, since only the last expression "
+        "is auto-returned.\n\n"
+        "RUNTIME: code runs in pydantic_monty, a restricted Python subset (not "
+        "full CPython): no class definitions, most stdlib modules and some "
+        "language features are unavailable, and there is no network/filesystem "
+        "access except through the wrapped functions above.\n\n"
         "Available wrapped API:\n\n"
         "```python\n"
-        "from typing import Any, Optional, Union, Literal\n\n"
-        f"{api}\n"
+        f"{stubs}\n"
         "```\n\n"
         "Prefer doing as much aggregation/filtering inside the program as "
         "possible so you make a single run_python call rather than many tool "
@@ -216,14 +249,15 @@ RUN_PYTHON_SPEC = {
         "name": "run_python",
         "description": (
             "Execute a Python program that may call the pre-defined wrapped "
-            "tool functions (see system prompt). Returns the program's stdout."
+            "tool functions (see system prompt). Returns a JSON object with the "
+            "value of the program's last expression and any printed stdout."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "code": {
                     "type": "string",
-                    "description": "The Python 3 source code to execute.",
+                    "description": "The Python source code to execute.",
                 }
             },
             "required": ["code"],
@@ -353,6 +387,11 @@ class Filter:
             # Per-chat persistence key. Prefer the explicit __chat_id__ dunder,
             # fall back to metadata; falsy => stateless REPL in the runner.
             _chat_id = extra_params.get("__chat_id__") or ""
+            # Typed stubs for the wrapped tools, handed to MontyRepl so its
+            # bundled checker recognizes tool names (resolved dynamically at
+            # runtime) rather than flagging every call as undefined. Same text
+            # the model sees in the system prompt's API block.
+            _type_check_stubs = _build_stubs(registry)
 
             async def run_python(code: str) -> str:
                 # Build the external-function table Monty dispatches to: name ->
@@ -387,7 +426,7 @@ class Filter:
                 # after a clean run. Globals/functions bound in a previous
                 # run_python call of this chat are therefore in scope here.
                 try:
-                    repl = _get_repl(_chat_id, persist)
+                    repl = _get_repl(_chat_id, persist, _type_check_stubs)
                     progress = repl.feed_start(code, print_callback=_print_callback)
 
                     # Monty pauses on two kinds of snapshot we care about:
@@ -436,7 +475,7 @@ class Filter:
                     result_value = progress.output
                     # Persist the chat's new namespace/heap for the next call.
                     _save_repl(_chat_id, repl, persist, cache_size)
-                except Exception as e:  # MontySyntaxError/MontyRuntimeError/etc.
+                except Exception as e:  # MontyTypingError/MontySyntaxError/MontyRuntimeError/etc.
                     log.warning(
                         f"{MARK} program execution failed: {type(e).__name__}"
                     )
